@@ -1,7 +1,14 @@
 import { env } from './env.js';
 import { igdbRequest } from './igdb.js';
 import { supabaseAdmin } from './supabase.js';
-import { getHltbTimes, type HltbTimes } from './hltb.js';
+import { getHltbTimes, getHltbByGameIds, type HltbTimes } from './hltb.js';
+import { createCache } from './cache.js';
+
+const ONE_HOUR = 60 * 60 * 1000;
+const discoverCache = createCache<unknown>(ONE_HOUR);
+// Short TTL so new ratings appear quickly. Aggregation is cheap (Supabase + maybe
+// one bulk IGDB call), so we don't need long-lived caching here.
+const peoplesChoiceCache = createCache<unknown>(60 * 1000);
 
 type IgdbCover = { image_id: string };
 type IgdbCompanyLink = {
@@ -132,6 +139,15 @@ function mapFullToRow(g: IgdbGameFull, hltb: HltbTimes) {
   };
 }
 
+function passesHltb(filters: DiscoverFilters) {
+  return ({ hltb }: { hltb: HltbTimes }) => {
+    if (hltb.main === null || hltb.main === undefined) return false;
+    if (filters.maxHours !== undefined && hltb.main > filters.maxHours) return false;
+    if (filters.minHours !== undefined && hltb.main < filters.minHours) return false;
+    return true;
+  };
+}
+
 function isFresh(updatedAt: string | null | undefined): boolean {
   if (!updatedAt) return false;
   return Date.now() - new Date(updatedAt).getTime() < TTL_MS;
@@ -193,9 +209,11 @@ export async function getGameSeries(igdbId: number): Promise<GameLite[]> {
 
 export type DiscoverFilters = {
   genre?: string;
+  theme?: string;
   developer?: string;
   publisher?: string;
   maxHours?: number;
+  minHours?: number;
   sort?: 'rating' | 'release_date' | 'name';
   limit?: number;
 };
@@ -218,15 +236,37 @@ async function resolveGenreId(name: string): Promise<number | null> {
   return res[0]?.id ?? null;
 }
 
-export async function discoverGames(filters: DiscoverFilters): Promise<GameLite[]> {
+async function resolveThemeId(name: string): Promise<number | null> {
+  const sanitized = name.replace(/"/g, '');
+  const res = await igdbRequest<{ id: number }[]>(
+    'themes',
+    `fields id; where name ~ *"${sanitized}"*; limit 1;`
+  );
+  return res[0]?.id ?? null;
+}
+
+export function discoverGames(filters: DiscoverFilters): Promise<GameLite[]> {
+  const key = JSON.stringify(filters);
+  return discoverCache.get(key, () => discoverGamesImpl(filters)) as Promise<GameLite[]>;
+}
+
+async function discoverGamesImpl(filters: DiscoverFilters): Promise<GameLite[]> {
   const limit = Math.min(Math.max(filters.limit ?? 20, 1), 50);
 
-  const where: string[] = ['version_parent = null', 'category = 0'];
+  // IGDB renamed `category` → `game_type` in late 2024. Use `game_type = 0` (main game).
+  // `version_parent = null` filters out re-releases / alternate editions.
+  const where: string[] = ['version_parent = null', 'game_type = 0'];
 
   if (filters.genre) {
     const id = await resolveGenreId(filters.genre);
     if (id === null) return [];
     where.push(`genres = (${id})`);
+  }
+
+  if (filters.theme) {
+    const id = await resolveThemeId(filters.theme);
+    if (id === null) return [];
+    where.push(`themes = (${id})`);
   }
 
   if (filters.developer) {
@@ -241,15 +281,26 @@ export async function discoverGames(filters: DiscoverFilters): Promise<GameLite[
     where.push(`involved_companies.company = ${id} & involved_companies.publisher = true`);
   }
 
-  const sortClause =
-    filters.sort === 'release_date'
-      ? 'sort first_release_date desc;'
-      : filters.sort === 'name'
-      ? 'sort name asc;'
-      : 'sort total_rating desc;';
+  let sortClause: string;
+  if (filters.sort === 'release_date') {
+    sortClause = 'sort first_release_date desc;';
+  } else if (filters.sort === 'name') {
+    sortClause = 'sort name asc;';
+  } else {
+    sortClause = 'sort total_rating desc;';
+    // Use IGDB's user rating (rating) which has higher vote counts than aggregated critic scores.
+    // Threshold of 100+ ratings filters out niche games with a handful of perfect scores.
+    where.push(
+      'total_rating != null',
+      'rating_count > 100',
+      `first_release_date < ${Math.floor(Date.now() / 1000)}`
+    );
+  }
 
-  // Over-fetch when maxHours is set so we can filter post-HLTB.
-  const igdbLimit = filters.maxHours ? Math.min(limit * 3, 50) : limit;
+  const needHltb = filters.maxHours !== undefined || filters.minHours !== undefined;
+  // Over-fetch heavily when HLTB-filtering: most top-rated games are mid-length, so
+  // a small pool yields few short or marathon hits. IGDB caps single requests at 500.
+  const igdbLimit = needHltb ? 200 : limit;
 
   const results = await igdbRequest<IgdbGameLite[]>(
     'games',
@@ -258,14 +309,87 @@ export async function discoverGames(filters: DiscoverFilters): Promise<GameLite[
 
   let games = results.map(mapLite);
 
-  if (filters.maxHours) {
-    const enriched = await Promise.all(
-      games.map(async (g) => ({ game: g, hltb: await getHltbTimes(g.name) }))
-    );
-    games = enriched
-      .filter(({ hltb }) => hltb.main !== null && hltb.main <= filters.maxHours!)
-      .map(({ game }) => game);
+  if (needHltb) {
+    // One IGDB call for all candidate ids — way faster than N serial lookups.
+    const hltbMap = await getHltbByGameIds(games.map((g) => g.igdb_id));
+    games = games.filter((g) => {
+      const hltb = hltbMap.get(g.igdb_id) ?? { main: null, mainExtra: null, completionist: null };
+      return passesHltb(filters)({ hltb });
+    });
   }
 
   return games.slice(0, limit);
+}
+
+export type PeoplesChoiceEntry = GameLite & { avg_rating: number; tracker_count: number };
+
+export function peoplesChoice(limit = 20): Promise<PeoplesChoiceEntry[]> {
+  return peoplesChoiceCache.get(`limit=${limit}`, () => peoplesChoiceImpl(limit)) as Promise<PeoplesChoiceEntry[]>;
+}
+
+// Tuning constants for the Bayesian weighted average.
+// `MIN_RATERS` filters out games with only one rater so a fluke 10/10 doesn't crown them.
+// `PRIOR_MEAN` (~7) is the neutral score we shrink toward — most ratings on a tracker
+// hover here. `PRIOR_WEIGHT` controls how aggressively we pull small samples toward
+// the prior; higher = more conservative.
+// Set to 1 while user-rating volume is low; Bayesian weighting still shrinks
+// single-rater entries toward the prior so they don't unfairly dominate.
+const MIN_RATERS = 1;
+const PRIOR_MEAN = 7;
+const PRIOR_WEIGHT = 3;
+
+async function peoplesChoiceImpl(limit = 20): Promise<PeoplesChoiceEntry[]> {
+  const { data: ratings } = await supabaseAdmin
+    .from('user_games')
+    .select('igdb_id, rating')
+    .not('rating', 'is', null);
+
+  if (!ratings || ratings.length === 0) return [];
+
+  const buckets = new Map<number, { sum: number; count: number }>();
+  for (const r of ratings as { igdb_id: number; rating: number }[]) {
+    const b = buckets.get(r.igdb_id) ?? { sum: 0, count: 0 };
+    b.sum += r.rating;
+    b.count += 1;
+    buckets.set(r.igdb_id, b);
+  }
+
+  // Bayesian weighted score: (n / (n + w)) * avg + (w / (n + w)) * prior
+  const scored = Array.from(buckets.entries())
+    .filter(([, { count }]) => count >= MIN_RATERS)
+    .map(([igdb_id, { sum, count }]) => {
+      const avg = sum / count;
+      const weighted = (count / (count + PRIOR_WEIGHT)) * avg + (PRIOR_WEIGHT / (count + PRIOR_WEIGHT)) * PRIOR_MEAN;
+      return { igdb_id, avg, count, weighted };
+    })
+    .sort((a, b) => b.weighted - a.weighted)
+    .slice(0, limit);
+
+  if (scored.length === 0) return [];
+
+  // Try the games cache first; lazy-fetch anything missing so newly-rated games surface
+  // even if no one has opened the detail page yet.
+  const ids = scored.map((s) => s.igdb_id);
+  const { data: cached } = await supabaseAdmin
+    .from('games')
+    .select('igdb_id, name, slug, cover_url, year')
+    .in('igdb_id', ids);
+  const cacheMap = new Map((cached ?? []).map((g) => [g.igdb_id as number, g as GameLite]));
+
+  const missing = ids.filter((id) => !cacheMap.has(id));
+  if (missing.length > 0) {
+    const fresh = await igdbRequest<IgdbGameLite[]>(
+      'games',
+      `${FIELDS_LITE} where id = (${missing.join(',')}); limit ${missing.length};`
+    );
+    for (const g of fresh) cacheMap.set(g.id, mapLite(g));
+  }
+
+  return scored
+    .map((s): PeoplesChoiceEntry | null => {
+      const g = cacheMap.get(s.igdb_id);
+      if (!g) return null;
+      return { ...g, avg_rating: Number(s.avg.toFixed(2)), tracker_count: s.count };
+    })
+    .filter((x): x is PeoplesChoiceEntry => x !== null);
 }
