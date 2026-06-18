@@ -13,5 +13,6 @@ export const env = {
   SUPABASE_SECRET_KEY: required('SUPABASE_SECRET_KEY'),
   IGDB_CLIENT_ID: required('IGDB_CLIENT_ID'),
   IGDB_CLIENT_SECRET: required('IGDB_CLIENT_SECRET'),
+  STEAMGRIDDB_API_KEY: process.env.STEAMGRIDDB_API_KEY ?? '',
   GAMES_CACHE_TTL_HOURS: Number(process.env.GAMES_CACHE_TTL_HOURS ?? 168),
 };

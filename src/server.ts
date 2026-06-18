@@ -8,6 +8,12 @@ import {
   searchGames,
   discoverGames,
   peoplesChoice,
+  getFeatured,
+  getFeaturedList,
+  getNewestPopular,
+  getCardsByIds,
+  getCalendarUpcoming,
+  getBrowseCategories,
   type DiscoverFilters,
 } from './games.js';
 
@@ -95,6 +101,82 @@ app.get('/api/peoples-choice', async (req, res, next) => {
     }
     const results = await peoplesChoice(limit);
     res.json({ results });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// Browse categories — each card carries its top-4 cover URLs.
+app.get('/api/browse-categories', async (_req, res, next) => {
+  try {
+    const categories = await getBrowseCategories();
+    res.json({ categories });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// Calendar of upcoming releases, bucketed by date (empty days are omitted).
+app.get('/api/calendar', async (req, res, next) => {
+  try {
+    const days = req.query.days ? Number(req.query.days) : 30;
+    if (!Number.isInteger(days) || days <= 0 || days > 180) {
+      return res.status(400).json({ error: 'Invalid days' });
+    }
+    const calendar = await getCalendarUpcoming(days);
+    res.json({ calendar });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// Newest popular games — actually-recent releases, ready to render.
+app.get('/api/newest', async (req, res, next) => {
+  try {
+    const limit = req.query.limit ? Number(req.query.limit) : 6;
+    if (!Number.isInteger(limit) || limit <= 0 || limit > 24) {
+      return res.status(400).json({ error: 'Invalid limit' });
+    }
+    const cards = await getNewestPopular(limit);
+    res.json({ cards });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// Hydrate a list of IGDB IDs into enriched cards (rating + genres + cover).
+// Used by "Games in your list" so the Astro page only has to fetch the user's
+// IDs from Supabase and hand them off here.
+app.get('/api/cards', async (req, res, next) => {
+  try {
+    const raw = String(req.query.ids ?? '');
+    const ids = raw.split(',').map((s) => Number(s.trim())).filter((n) => Number.isInteger(n) && n > 0);
+    if (ids.length === 0) return res.json({ cards: [] });
+    if (ids.length > 50) return res.status(400).json({ error: 'Too many ids' });
+    const cards = await getCardsByIds(ids);
+    // Preserve input order.
+    const map = new Map(cards.map((c) => [c.igdb_id, c]));
+    res.json({ cards: ids.map((id) => map.get(id)).filter(Boolean) });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// Curated top recommendation card (primary).
+app.get('/api/featured', async (_req, res, next) => {
+  try {
+    const featured = await getFeatured();
+    res.json({ featured });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// Carousel of featured top recommendations.
+app.get('/api/featured/list', async (_req, res, next) => {
+  try {
+    const featured = await getFeaturedList();
+    res.json({ featured });
   } catch (err) {
     next(err);
   }
