@@ -523,7 +523,7 @@ function upscaledCoverUrl(url: string | null): string | null {
   return url.replace('/t_cover_big/', '/t_cover_big_2x/');
 }
 
-const DEFAULT_PLATFORMS: FeaturedPlatform[] = [
+export const DEFAULT_PLATFORMS: FeaturedPlatform[] = [
   { key: "windows", label: "Windows" },
   { key: "playstation", label: "PlayStation" },
   { key: "xbox", label: "Xbox" },
@@ -617,39 +617,24 @@ export async function getFeatured(): Promise<FeaturedCard> {
 }
 
 // ──────────────── Randomized "Top Recommendations" ────────────────
-// Pool: top 100 by IGDB rating ∪ top 100 by rating count (popularity).
-// Cached for 1 hour. Each call samples N random ids from the pool and builds
-// full featured cards (IGDB detail + artwork + SteamGridDB hero/logo/cover).
+// Pool: top N most popular games by IGDB rating_count. Cached for 1 hour.
+// Each call samples N random ids from the pool and builds full featured cards
+// (IGDB detail + artwork + SteamGridDB hero/logo/cover).
 
 const randomPoolIdsCache = createCache<number[]>(ONE_HOUR);
 
-async function fetchRandomPoolIds(): Promise<number[]> {
+export async function fetchRandomPoolIds(targetSize = 200): Promise<number[]> {
   const now = Math.floor(Date.now() / 1000);
-  const [topRated, popular] = await Promise.all([
-    igdbRequest<{ id: number }[]>(
-      'games',
-      `fields id;
-       where total_rating != null
-         & rating_count > 100
-         & first_release_date != null
-         & first_release_date < ${now};
-       sort total_rating desc;
-       limit 100;`
-    ),
-    igdbRequest<{ id: number }[]>(
-      'games',
-      `fields id;
-       where total_rating_count > 0
-         & first_release_date != null
-         & first_release_date < ${now};
-       sort total_rating_count desc;
-       limit 100;`
-    ),
-  ]);
-  const set = new Set<number>();
-  for (const g of topRated) set.add(g.id);
-  for (const g of popular) set.add(g.id);
-  return [...set];
+  const popular = await igdbRequest<{ id: number }[]>(
+    'games',
+    `fields id;
+     where total_rating_count > 0
+       & first_release_date != null
+       & first_release_date < ${now};
+     sort total_rating_count desc;
+     limit ${targetSize};`
+  );
+  return popular.map((g) => g.id);
 }
 
 function pickRandom<T>(arr: T[], count: number): T[] {
@@ -661,7 +646,7 @@ function pickRandom<T>(arr: T[], count: number): T[] {
   return copy.slice(0, count);
 }
 
-async function buildFeaturedCardsForIds(ids: number[]): Promise<FeaturedCard[]> {
+export async function buildFeaturedCardsForIds(ids: number[]): Promise<FeaturedCard[]> {
   const unique = Array.from(new Set(ids));
 
   const [details, images] = await Promise.all([
@@ -701,7 +686,14 @@ async function buildFeaturedCardsForIds(ids: number[]): Promise<FeaturedCard[]> 
 }
 
 export async function getRandomFeatured(count = 7): Promise<FeaturedCard[]> {
-  const pool = await randomPoolIdsCache.get('pool', fetchRandomPoolIds);
+  // Fast path: Supabase-backed pre-built pool (refreshed every 6h).
+  const { getRandomFromPool } = await import('./featuredPool.js');
+  const fromPool = await getRandomFromPool(count).catch(() => [] as FeaturedCard[]);
+  if (fromPool.length > 0) return fromPool;
+
+  // Fallback: pool table is empty (first boot, before refresh completes).
+  // Build cards on the fly so the endpoint never returns nothing.
+  const pool = await randomPoolIdsCache.get('pool', () => fetchRandomPoolIds());
   if (pool.length === 0) return [];
   const picked = pickRandom(pool, count);
   return buildFeaturedCardsForIds(picked);

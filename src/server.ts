@@ -18,15 +18,11 @@ import {
   type DiscoverFilters,
 } from './games.js';
 import { getFreeGames, type FreePlatformFamily } from './gamerpower.js';
+import { startFeaturedPoolRefreshLoop } from './featuredPool.js';
 
 const app = express();
 app.use(cors({
-  origin: (origin, cb) => {
-    // Allow same-origin/no-origin requests (curl, server-to-server).
-    if (!origin) return cb(null, true);
-    if (env.ASTRO_ORIGIN.includes(origin)) return cb(null, true);
-    return cb(new Error(`Origin ${origin} not allowed by CORS`));
-  },
+  origin: env.ASTRO_ORIGIN,
   credentials: true,
 }));
 app.use(express.json());
@@ -241,6 +237,7 @@ app.listen(env.PORT, '0.0.0.0', () => {
   console.log(`API listening on http://127.0.0.1:${env.PORT}`);
   console.log(`CORS allowed origins: ${env.ASTRO_ORIGIN.join(', ')}`);
   prewarm();
+  startFeaturedPoolRefreshLoop();
 });
 
 function prewarm() {
