@@ -8,7 +8,10 @@ function required(name: string): string {
 
 export const env = {
   PORT: Number(process.env.PORT ?? 3000),
-  ASTRO_ORIGIN: process.env.ASTRO_ORIGIN ?? 'http://localhost:4321',
+  // Comma-separated list of allowed origins. Defaults cover Astro's port-stepping
+  // behavior when 4321/4322 are taken by other dev servers.
+  ASTRO_ORIGIN: (process.env.ASTRO_ORIGIN ?? 'http://localhost:4321,http://localhost:4322,http://localhost:4323,http://localhost:4324')
+    .split(',').map((s) => s.trim()).filter(Boolean),
   SUPABASE_URL: required('SUPABASE_URL'),
   SUPABASE_SECRET_KEY: required('SUPABASE_SECRET_KEY'),
   IGDB_CLIENT_ID: required('IGDB_CLIENT_ID'),

@@ -10,15 +10,25 @@ import {
   peoplesChoice,
   getFeatured,
   getFeaturedList,
+  getRandomFeatured,
   getNewestPopular,
   getCardsByIds,
   getCalendarUpcoming,
   getBrowseCategories,
   type DiscoverFilters,
 } from './games.js';
+import { getFreeGames, type FreePlatformFamily } from './gamerpower.js';
 
 const app = express();
-app.use(cors({ origin: env.ASTRO_ORIGIN, credentials: true }));
+app.use(cors({
+  origin: (origin, cb) => {
+    // Allow same-origin/no-origin requests (curl, server-to-server).
+    if (!origin) return cb(null, true);
+    if (env.ASTRO_ORIGIN.includes(origin)) return cb(null, true);
+    return cb(new Error(`Origin ${origin} not allowed by CORS`));
+  },
+  credentials: true,
+}));
 app.use(express.json());
 
 app.get('/health', (_req, res) => {
@@ -182,6 +192,40 @@ app.get('/api/featured/list', async (_req, res, next) => {
   }
 });
 
+// Randomized top recommendations — samples N from a pool of IGDB top-rated +
+// most-popular (~200 ids, cached 1h). Frontend "dice" button rerolls this.
+app.get('/api/featured/random', async (req, res, next) => {
+  try {
+    const count = req.query.count ? Number(req.query.count) : 7;
+    if (!Number.isInteger(count) || count <= 0 || count > 20) {
+      return res.status(400).json({ error: 'Invalid count' });
+    }
+    const featured = await getRandomFeatured(count);
+    res.json({ featured });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// Free games (GamerPower) — homepage list, filtered to PC/PS/Xbox.
+app.get('/api/free-games', async (req, res, next) => {
+  try {
+    const platformParam = req.query.platform ? String(req.query.platform).toLowerCase() : 'all';
+    const allowed: Array<FreePlatformFamily | 'all'> = ['all', 'pc', 'ps', 'xbox'];
+    if (!allowed.includes(platformParam as FreePlatformFamily | 'all')) {
+      return res.status(400).json({ error: 'Invalid platform. Use pc, ps, xbox, or all.' });
+    }
+    const limit = req.query.limit ? Number(req.query.limit) : 12;
+    if (!Number.isInteger(limit) || limit <= 0 || limit > 50) {
+      return res.status(400).json({ error: 'Invalid limit' });
+    }
+    const results = await getFreeGames({ platform: platformParam as FreePlatformFamily | 'all', limit });
+    res.json({ results });
+  } catch (err) {
+    next(err);
+  }
+});
+
 // Auth probe.
 app.get('/me', requireUser, (req, res) => {
   res.json({ userId: req.userId, email: req.userEmail });
@@ -195,7 +239,7 @@ app.use((err: unknown, _req: express.Request, res: express.Response, _next: expr
 // Listen on 0.0.0.0 so IPv4 'localhost' / 127.0.0.1 / IPv6 '::1' all resolve.
 app.listen(env.PORT, '0.0.0.0', () => {
   console.log(`API listening on http://127.0.0.1:${env.PORT}`);
-  console.log(`CORS allowed origin: ${env.ASTRO_ORIGIN}`);
+  console.log(`CORS allowed origins: ${env.ASTRO_ORIGIN.join(', ')}`);
   prewarm();
 });
 

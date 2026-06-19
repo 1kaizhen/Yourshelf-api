@@ -616,6 +616,97 @@ export async function getFeatured(): Promise<FeaturedCard> {
   return list[0];
 }
 
+// ──────────────── Randomized "Top Recommendations" ────────────────
+// Pool: top 100 by IGDB rating ∪ top 100 by rating count (popularity).
+// Cached for 1 hour. Each call samples N random ids from the pool and builds
+// full featured cards (IGDB detail + artwork + SteamGridDB hero/logo/cover).
+
+const randomPoolIdsCache = createCache<number[]>(ONE_HOUR);
+
+async function fetchRandomPoolIds(): Promise<number[]> {
+  const now = Math.floor(Date.now() / 1000);
+  const [topRated, popular] = await Promise.all([
+    igdbRequest<{ id: number }[]>(
+      'games',
+      `fields id;
+       where total_rating != null
+         & rating_count > 100
+         & first_release_date != null
+         & first_release_date < ${now};
+       sort total_rating desc;
+       limit 100;`
+    ),
+    igdbRequest<{ id: number }[]>(
+      'games',
+      `fields id;
+       where total_rating_count > 0
+         & first_release_date != null
+         & first_release_date < ${now};
+       sort total_rating_count desc;
+       limit 100;`
+    ),
+  ]);
+  const set = new Set<number>();
+  for (const g of topRated) set.add(g.id);
+  for (const g of popular) set.add(g.id);
+  return [...set];
+}
+
+function pickRandom<T>(arr: T[], count: number): T[] {
+  const copy = [...arr];
+  for (let i = copy.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [copy[i], copy[j]] = [copy[j], copy[i]];
+  }
+  return copy.slice(0, count);
+}
+
+async function buildFeaturedCardsForIds(ids: number[]): Promise<FeaturedCard[]> {
+  const unique = Array.from(new Set(ids));
+
+  const [details, images] = await Promise.all([
+    Promise.all(unique.map((id) => getGameDetail(id).catch(() => null))),
+    fetchGameImages(unique).catch(() => new Map<number, GameImages>()),
+  ]);
+  const detailMap = new Map(unique.map((id, i) => [id, details[i]] as const));
+
+  const stillMissing = unique.filter((id) => !images.get(id)?.background);
+  if (stillMissing.length) {
+    const shots = await fetchScreenshots(stillMissing).catch(() => new Map<number, string>());
+    for (const [id, ss] of shots.entries()) {
+      const existing = images.get(id) ?? {};
+      images.set(id, { ...existing, background: ss });
+    }
+  }
+
+  const sgdbMap = new Map<number, SgdbBundle>();
+  await Promise.all(
+    unique.map(async (id) => {
+      const d = detailMap.get(id);
+      if (!d?.name) return;
+      try {
+        sgdbMap.set(id, await getBundleByName(d.name));
+      } catch {
+        // SGDB is best-effort; fall back to IGDB art in fallbackCard().
+      }
+    })
+  );
+
+  const cards: FeaturedCard[] = [];
+  for (const id of ids) {
+    const card = fallbackCard(id, detailMap.get(id) ?? null, images.get(id), sgdbMap.get(id));
+    if (card) cards.push(card);
+  }
+  return cards;
+}
+
+export async function getRandomFeatured(count = 7): Promise<FeaturedCard[]> {
+  const pool = await randomPoolIdsCache.get('pool', fetchRandomPoolIds);
+  if (pool.length === 0) return [];
+  const picked = pickRandom(pool, count);
+  return buildFeaturedCardsForIds(picked);
+}
+
 // ──────────────── Enriched cards (for homepage rows) ────────────────
 
 export type EnrichedCard = GameLite & {
