@@ -3,7 +3,11 @@ import cors from 'cors';
 import { env } from './env.js';
 import { requireUser } from './auth.js';
 import {
-  getGameDetail,
+  getGameDetailExpanded,
+  getSimilarGames,
+  getRelatedGames,
+} from './gameDetailExpanded.js';
+import {
   getGameSeries,
   searchGames,
   discoverGames,
@@ -43,16 +47,81 @@ app.get('/api/search', async (req, res, next) => {
   }
 });
 
-// Full game detail (genres, companies, relationships, HLTB).
+// Full game detail. Returns the existing GameDetail fields plus the expanded
+// IGDB payload (storyline, screenshots, videos, platforms, release_dates,
+// game_modes, themes, player_perspectives, keywords, game_engines,
+// multiplayer_modes, language_supports, age_ratings, websites,
+// involved_companies, similar_games, parent_game, version_parent, bundles,
+// franchises, collections, external_games). See gameDetailExpanded.ts.
 app.get('/api/games/:id', async (req, res, next) => {
   try {
     const id = Number(req.params.id);
     if (!Number.isInteger(id) || id <= 0) {
       return res.status(400).json({ error: 'Invalid igdb id' });
     }
-    const game = await getGameDetail(id);
+    const game = await getGameDetailExpanded(id);
     if (!game) return res.status(404).json({ error: 'Game not found' });
     res.json({ game });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// Screenshot gallery (same shape as game.screenshots; useful for lazy-loading).
+app.get('/api/games/:id/screenshots', async (req, res, next) => {
+  try {
+    const id = Number(req.params.id);
+    if (!Number.isInteger(id) || id <= 0) {
+      return res.status(400).json({ error: 'Invalid igdb id' });
+    }
+    const game = await getGameDetailExpanded(id);
+    if (!game) return res.status(404).json({ error: 'Game not found' });
+    res.json({ screenshots: game.screenshots });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// Full uncapped list of similar games (the main detail caps at 12).
+app.get('/api/games/:id/similar', async (req, res, next) => {
+  try {
+    const id = Number(req.params.id);
+    if (!Number.isInteger(id) || id <= 0) {
+      return res.status(400).json({ error: 'Invalid igdb id' });
+    }
+    const similar = await getSimilarGames(id);
+    res.json({ similar });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// Full related-game graph: dlcs, expansions, remakes, remasters,
+// standalone_expansions, expanded_games, forks, ports.
+app.get('/api/games/:id/dlcs', async (req, res, next) => {
+  try {
+    const id = Number(req.params.id);
+    if (!Number.isInteger(id) || id <= 0) {
+      return res.status(400).json({ error: 'Invalid igdb id' });
+    }
+    const related = await getRelatedGames(id);
+    res.json(related);
+  } catch (err) {
+    next(err);
+  }
+});
+
+// Involved companies (developer / publisher / porting / supporting) with
+// company logos. Sourced from the same cached detail blob.
+app.get('/api/games/:id/companies', async (req, res, next) => {
+  try {
+    const id = Number(req.params.id);
+    if (!Number.isInteger(id) || id <= 0) {
+      return res.status(400).json({ error: 'Invalid igdb id' });
+    }
+    const game = await getGameDetailExpanded(id);
+    if (!game) return res.status(404).json({ error: 'Game not found' });
+    res.json({ involved: game.involved_companies });
   } catch (err) {
     next(err);
   }
